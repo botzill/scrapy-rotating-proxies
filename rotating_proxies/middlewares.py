@@ -12,7 +12,7 @@ from scrapy.utils.url import add_http_if_no_scheme
 from twisted.internet import task
 
 from .expire import Proxies, exp_backoff_full_jitter
-
+from scrapy.utils.python import global_object_name
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class RotatingProxyMiddleware(object):
       Default is 3600 (i.e. 60 min).
     """
     def __init__(self, proxy_list, logstats_interval, stop_if_no_proxies,
-                 max_proxies_to_try, backoff_base, backoff_cap, crawler):
+                 max_proxies_to_try, backoff_base, backoff_cap, priority_adjust, crawler):
 
         backoff = partial(exp_backoff_full_jitter, base=backoff_base, cap=backoff_cap)
         self.proxies = Proxies(self.cleanup_proxy_list(proxy_list),
@@ -73,6 +73,7 @@ class RotatingProxyMiddleware(object):
         self.reanimate_interval = 5
         self.stop_if_no_proxies = stop_if_no_proxies
         self.max_proxies_to_try = max_proxies_to_try
+        self.priority_adjust = priority_adjust
         self.stats = crawler.stats
 
     @classmethod
@@ -93,6 +94,7 @@ class RotatingProxyMiddleware(object):
             max_proxies_to_try=s.getint('ROTATING_PROXY_PAGE_RETRY_TIMES', 5),
             backoff_base=s.getfloat('ROTATING_PROXY_BACKOFF_BASE', 300),
             backoff_cap=s.getfloat('ROTATING_PROXY_BACKOFF_CAP', 3600),
+            priority_adjust=s.getint('ROTATING_PROXY_RETRY_PRIORITY_ADJUST'),
             crawler=crawler,
         )
         crawler.signals.connect(mw.engine_started,
@@ -149,12 +151,12 @@ class RotatingProxyMiddleware(object):
         return urlsplit(proxy).hostname
 
     def process_exception(self, request, exception, spider):
-        return self._handle_result(request, spider)
+        return self._handle_result(request, spider, reason=exception)
 
     def process_response(self, request, response, spider):
         return self._handle_result(request, spider) or response
 
-    def _handle_result(self, request, spider):
+    def _handle_result(self, request, spider, reason=None):
         proxy = self.proxies.get_proxy(request.meta.get('proxy', None))
         if not (proxy and request.meta.get('_rotating_proxy')):
             return
@@ -165,12 +167,12 @@ class RotatingProxyMiddleware(object):
         if ban is True:
             self.proxies.mark_dead(proxy)
             self.stats.set_value('proxies/dead', len(self.proxies.dead))
-            return self._retry(request, spider)
+            return self._retry(request, spider, reason=reason)
         elif ban is False:
             self.proxies.mark_good(proxy)
             self.stats.set_value('proxies/good', len(self.proxies.good))
 
-    def _retry(self, request, spider):
+    def _retry(self, request, spider, reason=None):
         retries = request.meta.get('proxy_retry_times', 0) + 1
         max_proxies_to_try = request.meta.get('max_proxies_to_try',
                                               self.max_proxies_to_try)
@@ -185,6 +187,14 @@ class RotatingProxyMiddleware(object):
             retryreq = request.copy()
             retryreq.meta['proxy_retry_times'] = retries
             retryreq.dont_filter = True
+            retryreq.priority = request.priority + self.priority_adjust
+
+            if isinstance(reason, Exception):
+                reason = global_object_name(reason.__class__)
+
+            self.stats.inc_value('proxies/retry/count')
+            self.stats.inc_value('proxies/retry/reason_count/%s' % reason)
+
             return retryreq
         else:
             logger.debug("Gave up retrying %(request)s (failed %(retries)d "
